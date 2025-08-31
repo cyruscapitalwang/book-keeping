@@ -468,17 +468,22 @@ def main():
                 ws.cell(row=r_i, column=deposit_col).value = "Income"
 
         else:
-            # Withdrawal / Fee (payments) — new rules first (most specific)
+            # Withdrawal / Fee (payments) — most specific rules first
             value = None
-            if ("santander" in dlow) and ("ting wang" in dlow):
+            if ("santander" in dlow):
                 value = "Car lease payment"
             elif ("telsa finasec" in dlow) and ("ting wang" in dlow):
                 value = "Car lease payment"
             elif ("chase credit crd" in dlow) and ("autopaybuss" in dlow):
                 value = "Credit Card Payment"
+            elif ("payment to chase card" in dlow):
+                value = "Credit card payment"
+            elif ("monthly service fee" in dlow):
+                value = "Bank service fee"
             elif ("e*trade" in dlow) and (amt_abs in (4617.50, 1250.00)):
                 value = "Xuefen Xie 401K contribution"
-            # Existing rules (only if nothing matched above)
+
+            # Existing fallback rules only if nothing matched above
             if value is None:
                 if "e*trade" in dlow:
                     value = "Transfer money to E*Trade Brokerage Account"
