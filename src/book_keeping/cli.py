@@ -37,7 +37,8 @@ def read_pdf_text(pdf_path: Path) -> str:
 # ==============================
 # Helpers / cleaners
 # ==============================
-_AMOUNT_RE = r"[\(\-]?\$?\d{1,3}(?:,\d{3})*(?:\.\d{2})[\)]?"
+# Allow amounts like ".21", "0.21", "47.15", "(1,204.21)", "-.59"
+_AMOUNT_RE = r"[\(\-]?\$?(?:\d{1,3}(?:,\d{3})*|\d)?(?:\.\d{2})[\)]?"
 
 def _norm_amount(s: str) -> Optional[float]:
     s1 = s.replace("$", "").replace(",", "").strip()
@@ -228,6 +229,11 @@ _SECTION_STARTS = [
     r"ACTIVITY\s+DETAILS",
 ]
 
+_SUMMARY_WITHIN_ACTIVITY = re.compile(
+    r"^\s*(TRANSACTIONS\s+THIS\s+CYCLE|INCLUDING\s+PAYMENTS\s+RECEIVED|TOTAL|SUBTOTAL)\b",
+    re.I
+)
+
 def _locate_cc_start(lines: List[str]) -> int:
     """Find index to start parsing from. Try known headers; else fall back to first date-at-start line."""
     for i, ln in enumerate(lines):
@@ -244,7 +250,9 @@ def parse_credit_card_transactions_multiline(
     text: str, default_year: int
 ) -> Tuple[List[Dict], Optional[float], Optional[float]]:
     """
-    Parse from section header onward; capture first 'New Balance' and 'Previous Balance' BEFORE the section.
+    Parse from section header onward; capture first 'New Balance' and 'Previous Balance'
+    BEFORE the section. Inside the activity, ignore summary lines such as
+    'TRANSACTIONS THIS CYCLE ...' to avoid stealing amounts from summaries.
     Returns (transactions, new_balance, previous_balance).
     """
     lines = text.splitlines()
@@ -291,6 +299,8 @@ def parse_credit_card_transactions_multiline(
         nonlocal current_date, current_lines
         if current_date is None or not current_lines:
             current_date = None; current_lines = []; return
+        # extract amount from the transaction block; prefer the last line,
+        # but only because we now guarantee summaries don't get appended
         for line in (current_lines[-1], current_lines[0], *reversed(current_lines)):
             m = amt_re.search(line or "")
             if m:
@@ -303,8 +313,9 @@ def parse_credit_card_transactions_multiline(
     for raw in work_lines:
         ln = (raw or "").rstrip()
 
-        # ignore summary rows inside activity
-        if re.search(r"\bNEW\s+BALANCE\b", ln, flags=re.I) or re.search(r"^\s*(total|subtotal)\b", ln, flags=re.I):
+        # ignore summary rows inside activity; if we're in a txn, end it first
+        if _SUMMARY_WITHIN_ACTIVITY.search(ln):
+            flush()
             continue
 
         m = start_date.match(ln)
@@ -659,41 +670,39 @@ def main():
 
             print(f"[INFO] Card {digits}: parsed {len(cc_txs)} transactions.")
 
-            # Compute the two required sums
-            sum_positive = round(sum(a for a in (float(t["Amount"]) for t in cc_txs) if a > 0), 2)
-            sum_negative_abs = round(abs(sum(a for a in (float(t["Amount"]) for t in cc_txs) if a < 0)), 2)
+            # Generic validation: Previous + Σ(all amounts) == New
+            sum_all = round(sum(float(t["Amount"]) for t in cc_txs), 2)
 
             nb_str = f"${new_balance:.2f}" if new_balance is not None else "(not found)"
             pb_str = f"${previous_balance:.2f}" if previous_balance is not None else "(not found)"
             print(f"[CARD {digits}] Previous Balance (PDF): {pb_str}")
             print(f"[CARD {digits}] New Balance (PDF)    : {nb_str}")
-            print(f"[CARD {digits}] Sum of positives     : ${sum_positive:.2f}  (should equal New Balance)")
-            print(f"[CARD {digits}] |Sum of negatives|   : ${sum_negative_abs:.2f}  (should equal Previous Balance)")
+            print(f"[CARD {digits}] Σ(all amounts)       : ${sum_all:.2f}")
+            print(f"[CARD {digits}] Check: Previous + Σ(amounts) == New")
 
-            errors = []
-
-            if new_balance is not None and not isclose(sum_positive, round(float(new_balance), 2), abs_tol=0.01):
-                errors.append(
-                    f"Positives != New Balance for *{digits}*: "
-                    f"${sum_positive:.2f} != ${float(new_balance):.2f}"
-                )
-
-            if previous_balance is not None and not isclose(sum_negative_abs, round(float(previous_balance), 2), abs_tol=0.01):
-                errors.append(
-                    f"|Negatives| != Previous Balance for *{digits}*: "
-                    f"${sum_negative_abs:.2f} != ${float(previous_balance):.2f}"
-                )
-
-            if errors:
-                msg = " | ".join(errors)
+            if (new_balance is None) or (previous_balance is None):
+                missing = []
+                if previous_balance is None: missing.append("Previous")
+                if new_balance is None:     missing.append("New")
+                msg = f"Missing {' and '.join(missing)} balance(s) for *{digits}*; cannot validate."
                 if not args.force:
                     raise AssertionError(msg)
                 else:
                     print("[WARN]", msg, "— continuing due to --force.")
+            else:
+                lhs = round(float(previous_balance) + sum_all, 2)
+                rhs = round(float(new_balance), 2)
+                if not isclose(lhs, rhs, abs_tol=0.01):
+                    msg = (f"Validation failed for *{digits}*: "
+                           f"Previous (${previous_balance:.2f}) + Σ(${sum_all:.2f}) "
+                           f"= ${lhs:.2f} != New (${new_balance:.2f})")
+                    if not args.force:
+                        raise AssertionError(msg)
+                    else:
+                        print("[WARN]", msg, "— continuing due to --force.")
 
             # Write the block to the worksheet (no row deletes/inserts)
             write_cc_block(ws_cc, blk, cc_txs)
-
     else:
         print("[WARN] Sheet 'Credit Card Register-Corp' not found; skipping CC population.")
 
