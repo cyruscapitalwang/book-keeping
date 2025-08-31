@@ -658,34 +658,42 @@ def main():
             cc_txs, new_balance, previous_balance = parse_credit_card_transactions_multiline(text, default_year=year)
 
             print(f"[INFO] Card {digits}: parsed {len(cc_txs)} transactions.")
-            if len(cc_txs) == 0:
-                print(f"[DIAG] Card {digits}: No transactions parsed. "
-                    f"Check PDF section headers and the table headers (Date/Amount/Expense Category) in the sheet.")
 
-            sum_activity = round(sum(float(t["Amount"]) for t in cc_txs), 2)
+            # Compute the two required sums
+            sum_positive = round(sum(a for a in (float(t["Amount"]) for t in cc_txs) if a > 0), 2)
+            sum_negative_abs = round(abs(sum(a for a in (float(t["Amount"]) for t in cc_txs) if a < 0)), 2)
+
             nb_str = f"${new_balance:.2f}" if new_balance is not None else "(not found)"
             pb_str = f"${previous_balance:.2f}" if previous_balance is not None else "(not found)"
-            print(f"[CARD {digits}] Previous Balance: {pb_str}")
-            print(f"[CARD {digits}] New Balance     : {nb_str}")
-            print(f"[CARD {digits}] Sum of activity  : ${sum_activity:.2f}")
+            print(f"[CARD {digits}] Previous Balance (PDF): {pb_str}")
+            print(f"[CARD {digits}] New Balance (PDF)    : {nb_str}")
+            print(f"[CARD {digits}] Sum of positives     : ${sum_positive:.2f}  (should equal New Balance)")
+            print(f"[CARD {digits}] |Sum of negatives|   : ${sum_negative_abs:.2f}  (should equal Previous Balance)")
 
-            # Reconcile: NewBalance - PreviousBalance == Sum(activity)
-            if (new_balance is not None) and (previous_balance is not None):
-                expected_activity = round(new_balance - previous_balance, 2)
-                if not isclose(expected_activity, sum_activity, abs_tol=0.01):
-                    msg = (f"Credit-card activity mismatch for *{digits}*: "
-                        f"(New - Previous) ${expected_activity:.2f} != Parsed sum ${sum_activity:.2f}")
-                    if not args.force:
-                        raise AssertionError(msg)
-                    else:
-                        print("[WARN]", msg, "— continuing due to --force.")
-            elif new_balance is not None:
-                print(f"[WARN] Previous Balance not found for *{digits}*; cannot verify activity vs balances.")
-            elif previous_balance is not None:
-                print(f"[WARN] New Balance not found for *{digits}*; cannot verify activity vs balances.")
+            errors = []
+
+            if new_balance is not None and not isclose(sum_positive, round(float(new_balance), 2), abs_tol=0.01):
+                errors.append(
+                    f"Positives != New Balance for *{digits}*: "
+                    f"${sum_positive:.2f} != ${float(new_balance):.2f}"
+                )
+
+            if previous_balance is not None and not isclose(sum_negative_abs, round(float(previous_balance), 2), abs_tol=0.01):
+                errors.append(
+                    f"|Negatives| != Previous Balance for *{digits}*: "
+                    f"${sum_negative_abs:.2f} != ${float(previous_balance):.2f}"
+                )
+
+            if errors:
+                msg = " | ".join(errors)
+                if not args.force:
+                    raise AssertionError(msg)
+                else:
+                    print("[WARN]", msg, "— continuing due to --force.")
 
             # Write the block to the worksheet (no row deletes/inserts)
             write_cc_block(ws_cc, blk, cc_txs)
+
     else:
         print("[WARN] Sheet 'Credit Card Register-Corp' not found; skipping CC population.")
 
