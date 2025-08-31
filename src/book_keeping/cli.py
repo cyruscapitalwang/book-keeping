@@ -442,8 +442,9 @@ def main():
         ws.cell(row=r_i, column=check_col).value = full_desc
         ws.cell(row=r_i, column=check_col).alignment = Alignment(wrap_text=True)
 
-        # Deposit/Expense classification rules
+        # Deposit/Expense classification rules (specific -> general)
         dlow = full_desc.lower()
+
         if t["Section"] == "deposit":
             if "transfer" in dlow and "0639" in dlow:
                 ws.cell(row=r_i, column=deposit_col).value = "Promissory Note to bond holder Ting Wang"
@@ -453,14 +454,24 @@ def main():
                 ws.cell(row=r_i, column=deposit_col).value = "Income by Consulting with GAINSystems"
             elif "allegis group" in dlow:
                 ws.cell(row=r_i, column=deposit_col).value = "Income by Consulting with JP Morgan Chase"
+            elif "quinnox" in dlow:
+                ws.cell(row=r_i, column=deposit_col).value = "Income by Consulting with US Bank"
             else:
                 ws.cell(row=r_i, column=deposit_col).value = "Income"
+
         else:
+            # Withdrawal / Fee (payments)
             value = "Payment"
             if "e*trade" in dlow:
                 value = "Transfer money to E*Trade Brokerage Account"
             elif "transfer" in dlow and "0639" in dlow:
                 value = "Return money to bond holder Ting Wang"
+            elif "gusto" in dlow:
+                value = "Payroll professional service fee"
+            elif (("u.s. bank" in dlow) or ("us bank" in dlow)) and (("lse pmts" in dlow) or ("lease" in dlow)):
+                value = "Car lease payment"
+            elif ("tesla" in dlow) or ("telsa" in dlow):  # handle common misspelling
+                value = "Car wireless subscription payment"
             ws.cell(row=r_i, column=expense_col).value = value
 
     # Format date & amount columns
