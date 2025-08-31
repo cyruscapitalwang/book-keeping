@@ -6,7 +6,7 @@ One-flag CLI to build/update your **Check Register-Corp** sheet from a Chase che
 
 ```bash
 uv sync
-uv run book-keeping --directory "C:\\Users\\admin\\CyrusCapital\\Book Keeping\\2024-07"
+uv run book-keeping --directory "C:\\Users\\admin\\CyrusCapital\\Book Keeping\\2024-07" [--dry-run] [--verbose]
 ```
 
 ## STRICT inputs required in the target folder
@@ -14,9 +14,9 @@ uv run book-keeping --directory "C:\\Users\\admin\\CyrusCapital\\Book Keeping\\2
 - **Chase PDF**: filename must contain **`2590`** (e.g., `...2590....pdf`)
 
 ## Behavior
-- Parses last folder name `YYYY-MM`, copies `Corp Registers_.xlsx` to `Corp Registers_YYYYMM.xlsx`.
+- Parses last folder name `YYYY-MM`, copies `Corp Registers_.xlsx` to `Corp Registers_YYYYMM.xlsx` (unless `--dry-run`).
 - Uses only the PDF containing `2590`; fails if not present.
-- Sets B9 to the first day of that month.
-- Parses Deposits/Withdrawals/Fees (ignores Daily Ending Balance), writes full paragraph (single-line) to Check #, wraps text, absolute Amounts, date `MM/dd/yyyy`.
-- Deposit (E) & Expense (D) rules per your specs.
-- Hides extra sheets, auto-fits columns.
+- Sets B9 to the first day of that month; writes transactions; formatting & rules as before.
+- Prints **section totals** from the PDF and from the data written; **asserts they match** to the cent.
+- `--dry-run`: simulate, print plan & totals, **do not write files**.
+- `--verbose`: print detailed steps.
