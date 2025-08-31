@@ -81,13 +81,16 @@ def clean_description(desc: str) -> str:
 # Parser with PDF totals + reconciliation
 # ==============================
 def parse_chase_transactions_full(
-    text: str, verbose: bool = False
+    text: str,
+    default_year: int,
+    verbose: bool = False,
 ) -> Tuple[List[Dict], Dict[str, float], Dict[str, List[str]]]:
     """
     Parse statement text into transactions with full multi-line descriptions,
     collect PDF section totals (Deposits/Withdrawals/Fees), and capture
     unparsed lines per section for reconciliation.
 
+    - default_year: year to assume when a date in the PDF omits the year.
     Supports:
       - strict headers (date[s] at start, amount at end)
       - two-line headers (amount on next line)
@@ -194,7 +197,7 @@ def parse_chase_transactions_full(
             d2m, d2d, d2y = g[3], g[4], g[5]
             desc = g[6]
             amt_str = g[7]
-            year  = int((d2y or d1y) or "2024")
+            year  = int((d2y or d1y) or str(default_year))
             month = int((d2m or d1m))
             day   = int((d2d or d1d))
             try:
@@ -213,7 +216,7 @@ def parse_chase_transactions_full(
             d1m, d1d, d1y = m_no.group(1), m_no.group(2), m_no.group(3)
             d2m, d2d, d2y = m_no.group(4), m_no.group(5), m_no.group(6)
             desc_only = m_no.group(7)
-            year  = int((d2y or d1y) or "2024")
+            year  = int((d2y or d1y) or str(default_year))
             month = int((d2m or d1m))
             day   = int((d2d or d1d))
             try:
@@ -236,7 +239,7 @@ def parse_chase_transactions_full(
             if amt is None:
                 unparsed[section].append(ln); continue
             mm, dd, yy = int(dmatch.group(1)), int(dmatch.group(2)), dmatch.group(3)
-            year = int(yy or "2024")
+            year = int(yy) if yy else default_year
             try:
                 tx_date = datetime(year, mm, dd).date()
             except ValueError:
@@ -347,9 +350,13 @@ def main():
         print(f"[INFO] Template (project root): {template.name}")
         print(f"[INFO] PDF (target folder): {pdf_path.name}")
 
-    # Parse the PDF
+    # Parse the PDF (pass year from folder as default_year)
     text = read_pdf_text(pdf_path)
-    transactions, pdf_totals, unparsed = parse_chase_transactions_full(text, verbose=args.verbose)
+    transactions, pdf_totals, unparsed = parse_chase_transactions_full(
+        text,
+        default_year=year,
+        verbose=args.verbose,
+    )
 
     # Preserve original order: deposit -> withdrawal -> fee
     ordered_tx: List[Dict] = []
@@ -444,6 +451,7 @@ def main():
 
         # Deposit/Expense classification rules (specific -> general)
         dlow = full_desc.lower()
+        amt_abs = round(abs(float(t["Amount"])), 2)
 
         if t["Section"] == "deposit":
             if "transfer" in dlow and "0639" in dlow:
@@ -460,18 +468,30 @@ def main():
                 ws.cell(row=r_i, column=deposit_col).value = "Income"
 
         else:
-            # Withdrawal / Fee (payments)
-            value = "Payment"
-            if "e*trade" in dlow:
-                value = "Transfer money to E*Trade Brokerage Account"
-            elif "transfer" in dlow and "0639" in dlow:
-                value = "Return money to bond holder Ting Wang"
-            elif "gusto" in dlow:
-                value = "Payroll professional service fee"
-            elif (("u.s. bank" in dlow) or ("us bank" in dlow)) and (("lse pmts" in dlow) or ("lease" in dlow)):
+            # Withdrawal / Fee (payments) — new rules first (most specific)
+            value = None
+            if ("santander" in dlow) and ("ting wang" in dlow):
                 value = "Car lease payment"
-            elif ("tesla" in dlow) or ("telsa" in dlow):  # handle common misspelling
-                value = "Car wireless subscription payment"
+            elif ("telsa finasec" in dlow) and ("ting wang" in dlow):
+                value = "Car lease payment"
+            elif ("chase credit crd" in dlow) and ("autopaybuss" in dlow):
+                value = "Credit Card Payment"
+            elif ("e*trade" in dlow) and (amt_abs in (4617.50, 1250.00)):
+                value = "Xuefen Xie 401K contribution"
+            # Existing rules (only if nothing matched above)
+            if value is None:
+                if "e*trade" in dlow:
+                    value = "Transfer money to E*Trade Brokerage Account"
+                elif "transfer" in dlow and "0639" in dlow:
+                    value = "Return money to bond holder Ting Wang"
+                elif "gusto" in dlow:
+                    value = "Payroll professional service fee"
+                elif (("u.s. bank" in dlow) or ("us bank" in dlow)) and (("lse pmts" in dlow) or ("lease" in dlow)):
+                    value = "Car lease payment"
+                elif ("tesla" in dlow) or ("telsa" in dlow):  # handle common misspelling
+                    value = "Car wireless subscription payment"
+                else:
+                    value = "Payment"
             ws.cell(row=r_i, column=expense_col).value = value
 
     # Format date & amount columns
