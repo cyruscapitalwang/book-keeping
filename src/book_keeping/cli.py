@@ -11,9 +11,9 @@ from openpyxl.styles import numbers, Alignment
 from openpyxl.utils import get_column_letter
 
 
-# -----------------------
+# ==============================
 # PDF text extraction
-# -----------------------
+# ==============================
 def read_pdf_text(pdf_path: Path) -> str:
     """
     Extract text from PDF using pdfplumber if available, else PyPDF2.
@@ -37,9 +37,11 @@ def read_pdf_text(pdf_path: Path) -> str:
         return ""
 
 
-# -----------------------
-# Helpers
-# -----------------------
+# ==============================
+# Helpers / cleaners
+# ==============================
+_AMOUNT_RE = r"[\(\-]?\$?\d{1,3}(?:,\d{3})*(?:\.\d{2})[\)]?"
+
 def _norm_amount(s: str) -> float | None:
     s1 = s.replace("$", "").replace(",", "").strip()
     neg = False
@@ -55,18 +57,43 @@ def _norm_amount(s: str) -> float | None:
         return None
     return -v if neg else v
 
+def strip_after_amount(line: str) -> str:
+    """
+    If a line contains an amount and then extra trailing text (e.g., '... 10,000.00 Page 2 of 6 ...'),
+    return only up to (and including) the FIRST amount. Otherwise return the line unchanged.
+    """
+    m = re.search(_AMOUNT_RE, line)
+    if not m:
+        return line
+    return line[: m.end()].rstrip()
 
-# -----------------------
+def clean_description(desc: str) -> str:
+    """
+    Remove common PDF artifacts (page footers, long numeric blobs), collapse whitespace.
+    """
+    desc = re.sub(r"\bPage\s+\d+\s+of\s+\d+\b", "", desc, flags=re.I)
+    desc = re.sub(r"\d{6,}", "", desc)   # very long number garbage
+    desc = re.sub(r"\s+", " ", desc)
+    return desc.strip()
+
+
+# ==============================
 # Parser with PDF totals + reconciliation
-# -----------------------
+# ==============================
 def parse_chase_transactions_full(
     text: str, verbose: bool = False
 ) -> Tuple[List[Dict], Dict[str, float], Dict[str, List[str]]]:
     """
     Parse statement text into transactions with full multi-line descriptions,
     collect PDF section totals (Deposits/Withdrawals/Fees), and capture
-    unparsed lines per section for reconciliation. Supports two-line headers
-    where the amount appears on the next line. DOES NOT deduplicate.
+    unparsed lines per section for reconciliation.
+
+    Supports:
+      - strict headers (date[s] at start, amount at end)
+      - two-line headers (amount on next line)
+      - loose headers (date anywhere, amount at end)
+      - continuation lines (to keep Trace# etc.)
+      - NO deduplication (distinct lines kept)
     """
     sect_deposits     = re.compile(r"^\s*DEPOSITS\s+AND\s+ADDITIONS\b", re.I)
     sect_withdrawals  = re.compile(r"^\s*ELECTRONIC\s+WITHDRAWALS\b", re.I)
@@ -75,35 +102,26 @@ def parse_chase_transactions_full(
     line_total        = re.compile(r"^\s*TOTAL\b", re.I)
 
     date_re    = r"(0[1-9]|1[0-2])/(0[1-9]|[12]\d|3[01])(?:/(20\d{2}))?"
-    amount_re  = r"[\(\-]?\$?\d{1,3}(?:,\d{3})*(?:\.\d{2})[\)]?"
+    amount_re  = _AMOUNT_RE
 
     # Header types
-    tx_header_strict = re.compile(rf"^\s*{date_re}(?:\s+{date_re})?\s+(.*?)\s+({amount_re})\s*$")  # date(s) at start, amount at end
-    tx_header_no_amt = re.compile(rf"^\s*{date_re}(?:\s+{date_re})?\s+(?!.*{amount_re}\s*$)(.+)$")  # date(s) at start, NO amount (2-line)
+    tx_header_strict = re.compile(
+        rf"^\s*{date_re}(?:\s+{date_re})?\s+(.*?)\s+({amount_re})\s*$"
+    )  # date(s) at start, amount at end
+    tx_header_no_amt = re.compile(
+        rf"^\s*{date_re}(?:\s+{date_re})?\s+(?!.*{amount_re}\s*$)(.+)$"
+    )  # date(s) at start, NO amount (2-line)
     tx_header_loose  = re.compile(rf".*?{date_re}.*?({amount_re})\s*$")  # date anywhere, amount at end
 
     trailing_amt = re.compile(rf"({amount_re})\s*$")
-
-    def _norm_amount(s: str) -> float | None:
-        s1 = s.replace("$", "").replace(",", "").strip()
-        neg = False
-        if s1.startswith("(") and s1.endswith(")"):
-            neg = True; s1 = s1[1:-1]
-        if s1.startswith("-"):
-            neg = True; s1 = s1[1:]
-        try:
-            v = float(s1)
-        except ValueError:
-            return None
-        return -v if neg else v
 
     transactions: List[Dict] = []
     pdf_totals = {"deposit": 0.0, "withdrawal": 0.0, "fee": 0.0}
     unparsed: Dict[str, List[str]] = {"deposit": [], "withdrawal": [], "fee": []}
 
     section = None
-    current: Dict | None = None     # accumulating {Date, Amount, Section, desc_lines:[...]}
-    pending_header: Dict | None = None  # for two-line header (amount on next line)
+    current: Dict | None = None           # accumulating {Date, Amount, Section, desc_lines:[...]}
+    pending_header: Dict | None = None    # for two-line header (amount on next line)
 
     def finalize_current():
         nonlocal current
@@ -136,7 +154,7 @@ def parse_chase_transactions_full(
         if not section:
             continue
 
-        # Section TOTAL: capture PDF total and close any open tx
+        # Section TOTAL: record PDF total and close any open tx
         if line_total.search(ln):
             m_amt = trailing_amt.search(ln)
             if m_amt:
@@ -147,23 +165,24 @@ def parse_chase_transactions_full(
             pending_header = None
             continue
 
-        # 2-line header: we already have date/desc but need the amount on next line
+        # --- Two-line header: we already have date/desc, expect amount on next line ---
         if pending_header is not None:
-            m_amt = trailing_amt.search(ln)
-            if m_amt:
-                amt = _norm_amount(m_amt.group(1))
+            ln_clipped = strip_after_amount(ln)
+            m_amt_first = re.search(amount_re, ln_clipped)  # FIRST amount
+            if m_amt_first:
+                amt = _norm_amount(m_amt_first.group(0))
                 if amt is not None:
                     current = {
                         "Date": pending_header["date"],
                         "Amount": amt,
                         "Section": pending_header["section"],
-                        "desc_lines": [pending_header["desc"], ln],
+                        "desc_lines": [pending_header["desc"], ln_clipped],
                     }
                     pending_header = None
                     # keep accumulating continuation lines in subsequent iterations
                     continue
             # not an amount line — treat as continuation of description
-            pending_header["desc"] += " " + ln
+            pending_header["desc"] += " " + ln_clipped
             continue
 
         # Strict header: start a new current (do NOT finalize yet)
@@ -208,10 +227,13 @@ def parse_chase_transactions_full(
         # Loose header (date anywhere, amount at end): start a new current
         m2 = tx_header_loose.match(ln)
         if m2:
-            amt_str = m2.group(1)
-            amt = _norm_amount(amt_str)
-            dmatch = re.search(date_re, ln)
-            if amt is None or not dmatch:
+            ln_clipped = strip_after_amount(ln)
+            m_amt_first = re.search(amount_re, ln_clipped)
+            dmatch = re.search(date_re, ln_clipped)
+            if not (m_amt_first and dmatch):
+                unparsed[section].append(ln); continue
+            amt = _norm_amount(m_amt_first.group(0))
+            if amt is None:
                 unparsed[section].append(ln); continue
             mm, dd, yy = int(dmatch.group(1)), int(dmatch.group(2)), dmatch.group(3)
             year = int(yy or "2024")
@@ -220,12 +242,12 @@ def parse_chase_transactions_full(
             except ValueError:
                 unparsed[section].append(ln); continue
             finalize_current()
-            current = {"Date": tx_date, "Amount": amt, "Section": section, "desc_lines": [ln]}
+            current = {"Date": tx_date, "Amount": amt, "Section": section, "desc_lines": [ln_clipped]}
             continue
 
         # Continuation line for an open current?
         if current is not None:
-            current["desc_lines"].append(ln)
+            current["desc_lines"].append(strip_after_amount(ln))
             continue
 
         # Otherwise, we couldn't place this line
@@ -241,10 +263,9 @@ def parse_chase_transactions_full(
     return transactions, pdf_totals, unparsed
 
 
-
-# -----------------------
+# ==============================
 # Excel helpers
-# -----------------------
+# ==============================
 def find_headers(ws):
     """
     Locate header row and key columns: Date, Check #, Amount.
@@ -274,9 +295,9 @@ def compute_section_sums(transactions: List[Dict]) -> Dict[str, float]:
     return sums
 
 
-# -----------------------
+# ==============================
 # Main
-# -----------------------
+# ==============================
 def main():
     parser = argparse.ArgumentParser(
         description="Book-keeping: build/update register (STRICT inputs). Template is read from project root."
@@ -415,9 +436,9 @@ def main():
         ws.cell(row=r_i, column=date_col).value = t["Date"]
         ws.cell(row=r_i, column=amt_col).value = abs(float(t["Amount"]))
 
-        # Full paragraph → single line with wrapping
+        # Full paragraph → single line with wrapping + cleanup
         full_desc = (t.get("Description") or "").replace("\r", " ").replace("\n", " ").replace("\t", " ")
-        full_desc = re.sub(r"\s+", " ", full_desc).strip()
+        full_desc = clean_description(full_desc)
         ws.cell(row=r_i, column=check_col).value = full_desc
         ws.cell(row=r_i, column=check_col).alignment = Alignment(wrap_text=True)
 
