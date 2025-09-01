@@ -299,15 +299,20 @@ def parse_credit_card_transactions_multiline(
         nonlocal current_date, current_lines
         if current_date is None or not current_lines:
             current_date = None; current_lines = []; return
+        # Build a description from the whole block
+        desc = clean_text(" ".join(current_lines))
         # extract amount from the transaction block; prefer the last line,
         # but only because we now guarantee summaries don't get appended
+        amt_val: Optional[float] = None
         for line in (current_lines[-1], current_lines[0], *reversed(current_lines)):
             m = amt_re.search(line or "")
             if m:
-                amt = _norm_amount(m.group(0))
-                if amt is not None:
-                    txs.append({"Date": current_date, "Amount": amt})
+                val = _norm_amount(m.group(0))
+                if val is not None:
+                    amt_val = val
                     break
+        if amt_val is not None:
+            txs.append({"Date": current_date, "Amount": amt_val, "Desc": desc})
         current_date = None; current_lines = []
 
     for raw in work_lines:
@@ -435,10 +440,11 @@ def scan_cc_blocks(ws) -> List[Dict]:
     return blocks
 
 
-def write_cc_block(ws, block: Dict, txs: List[Dict]):
+def write_cc_block(ws, block: Dict, txs: List[Dict], previous_balance: Optional[float] = None):
     """
     Write txs into the block’s Date/Amount/Category columns starting at header_row+1.
     Do NOT delete/insert rows (avoids nuking other blocks on the same rows).
+    Adds Expense Category classification per user rules.
     """
     start_row = block["header_row"] + 1
     date_col, amount_col, cat_col = block["date_col"], block["amount_col"], block["cat_col"]
@@ -450,13 +456,36 @@ def write_cc_block(ws, block: Dict, txs: List[Dict]):
         ws.cell(row=rr, column=amount_col).value = None
         ws.cell(row=rr, column=cat_col).value = None
 
+    def classify(desc: str, amt: float) -> str:
+        d = (desc or "").lower()
+        # (1) Negative amounts
+        if amt < 0:
+            if ("payment" in d) and (previous_balance is not None) and isclose(abs(amt), abs(float(previous_balance)), abs_tol=0.01):
+                return "Automatic Payment Received From Checking Account"
+            return "Office Supplies Credit"
+        # (2) Office suppliers big-box
+        if any(k in d for k in ["amazon", "walmart", "lowes", "costco", "home depot", "menards"]):
+            return "Office Suppliers"
+        # (3) Apple
+        if "apple" in d:
+            return "Company hardware purchase"
+        # (4) Travel (transport/parking/etc.)
+        if any(k in d for k in ["united", "iparkit", "driven car"]):
+            return "Travel and Entertainment - Travel"
+        # (5) Dues / subscriptions
+        if any(k in d for k in ["chatgpt", "github", "yahoo"]):
+            return "Dues and Subscriptions"
+        # (6) Default
+        return "Travel and Entertainment - Meals"
+
     # 2) Write transactions sequentially
     for i, t in enumerate(txs):
         r = start_row + i
+        amt = float(t["Amount"])
+        desc = t.get("Desc", "")
         ws.cell(row=r, column=date_col).value = t["Date"]
-        ws.cell(row=r, column=amount_col).value = t["Amount"]
-        cat = "Travel and Entertainment - Meals" if float(t["Amount"]) > 0 else "Office Suppliers Credit"
-        ws.cell(row=r, column=cat_col).value = cat
+        ws.cell(row=r, column=amount_col).value = amt
+        ws.cell(row=r, column=cat_col).value = classify(desc, amt)
 
     # 3) Formats for these columns only
     for i in range(max(1, len(txs))):
@@ -701,8 +730,8 @@ def main():
                     else:
                         print("[WARN]", msg, "— continuing due to --force.")
 
-            # Write the block to the worksheet (no row deletes/inserts)
-            write_cc_block(ws_cc, blk, cc_txs)
+            # Write the block (now with category rules; pass previous_balance)
+            write_cc_block(ws_cc, blk, cc_txs, previous_balance=previous_balance)
     else:
         print("[WARN] Sheet 'Credit Card Register-Corp' not found; skipping CC population.")
 
