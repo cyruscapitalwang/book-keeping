@@ -250,26 +250,49 @@ def parse_credit_card_transactions_multiline(
     text: str, default_year: int
 ) -> Tuple[List[Dict], Optional[float], Optional[float]]:
     """
-    Parse from section header onward; capture first 'New Balance' and 'Previous Balance'
-    BEFORE the section. Inside the activity, ignore summary lines such as
-    'TRANSACTIONS THIS CYCLE ...' to avoid stealing amounts from summaries.
-    Returns (transactions, new_balance, previous_balance).
+    Header-agnostic CC parser:
+      - Finds Previous/New balance anywhere before the first transaction line.
+      - Treats ANY line containing a date token as a transaction start, even if the
+        date isn't at the start of the line and even if it has a trailing footnote
+        (e.g., 07/08/24* or 07/08/2024†).
+      - Builds a block until the next date line or a summary row.
+      - Extracts the amount from the block (last line first, then others).
     """
     lines = text.splitlines()
 
-    # Capture balances BEFORE activity
-    new_balance: float | None = None
-    prev_balance: float | None = None
+    # ---- balances (scan from the top until we see the first transaction line) ----
+    date_token = re.compile(
+        r"(?:^|\s)(?P<mm>0[1-9]|1[0-2])/"
+        r"(?P<dd>0[1-9]|[12]\d|3[01])"
+        r"(?:/(?P<yy>\d{2,4}))?"
+        r"(?:[*•†‡])?(?=\D|$)",
+        re.I,
+    )
+    amt_re = re.compile(_AMOUNT_RE)
     nb_re  = re.compile(r"\bNEW\s+BALANCE\b", re.I)
     pb_res = [
         re.compile(r"\bPREVIOUS\s+BALANCE\b", re.I),
         re.compile(r"\bBALANCE\s+FROM\s+LAST\s+STATEMENT\b", re.I),
         re.compile(r"\bPRIOR\s+BALANCE\b", re.I),
     ]
-    amt_re = re.compile(_AMOUNT_RE)
+    summary_guard = re.compile(
+        r"^\s*(TRANSACTIONS\s+THIS\s+CYCLE|INCLUDING\s+PAYMENTS\s+RECEIVED|TOTAL|SUBTOTAL)\b",
+        re.I
+    )
 
-    start_idx = _locate_cc_start(lines)
-    for i in range(0, start_idx):
+    new_balance: float | None = None
+    prev_balance: float | None = None
+
+    # find the first index that looks like a transaction line (has a date token)
+    first_tx_idx = None
+    for i, ln in enumerate(lines):
+        if date_token.search(ln or ""):
+            first_tx_idx = i
+            break
+
+    # grab balances from before that point
+    scan_upto = first_tx_idx if first_tx_idx is not None else len(lines)
+    for i in range(scan_upto):
         ln = lines[i]
         if new_balance is None and nb_re.search(ln):
             m_amt = amt_re.search(ln)
@@ -287,49 +310,53 @@ def parse_credit_card_transactions_multiline(
                             prev_balance = v
                             break
 
-    work_lines = lines[start_idx:]
-
-    # Parse transactions in activity
-    start_date = re.compile(r"^\s*(?P<mm>0[1-9]|1[0-2])/(?P<dd>0[1-9]|[12]\d|3[01])(?:/(?P<yy>\d{2,4}))?\b")
+    # ---- collect transactions (anywhere after the first tx-looking line) ----
     txs: List[Dict] = []
+    if first_tx_idx is None:
+        return txs, new_balance, prev_balance
+
     current_date: Optional[date] = None
     current_lines: List[str] = []
 
     def flush():
         nonlocal current_date, current_lines
         if current_date is None or not current_lines:
-            current_date = None; current_lines = []; return
-        # Build a description from the whole block
+            current_date = None
+            current_lines = []
+            return
+        # full description for rule-based categorization
         desc = clean_text(" ".join(current_lines))
-        # extract amount from the transaction block; prefer the last line,
-        # but only because we now guarantee summaries don't get appended
-        amt_val: Optional[float] = None
+        # extract an amount from the block (prefer the last line, then first, then others)
+        amount_val: Optional[float] = None
         for line in (current_lines[-1], current_lines[0], *reversed(current_lines)):
             m = amt_re.search(line or "")
             if m:
-                val = _norm_amount(m.group(0))
-                if val is not None:
-                    amt_val = val
+                v = _norm_amount(m.group(0))
+                if v is not None:
+                    amount_val = v
                     break
-        if amt_val is not None:
-            txs.append({"Date": current_date, "Amount": amt_val, "Desc": desc})
-        current_date = None; current_lines = []
+        if amount_val is not None:
+            txs.append({"Date": current_date, "Amount": amount_val, "Desc": desc})
+        current_date = None
+        current_lines = []
 
-    for raw in work_lines:
+    for raw in lines[first_tx_idx:]:
         ln = (raw or "").rstrip()
 
-        # ignore summary rows inside activity; if we're in a txn, end it first
-        if _SUMMARY_WITHIN_ACTIVITY.search(ln):
+        # summary/subtotal rows end a block but are themselves ignored
+        if summary_guard.search(ln):
             flush()
             continue
 
-        m = start_date.match(ln)
+        m = date_token.search(ln)
         if m:
             flush()
-            mm = int(m.group("mm")); dd = int(m.group("dd"))
+            mm = int(m.group("mm"))
+            dd = int(m.group("dd"))
             yy = m.group("yy")
             if yy:
-                yy = int(yy); yy = (2000 + yy) if yy < 100 else yy
+                yy = int(yy)
+                yy = (2000 + yy) if yy < 100 else yy
             else:
                 yy = default_year
             try:
@@ -343,6 +370,7 @@ def parse_credit_card_transactions_multiline(
 
     flush()
     return txs, new_balance, prev_balance
+
 
 
 # ==============================
@@ -379,17 +407,17 @@ def scan_cc_blocks(ws) -> List[Dict]:
     """
     Find card blocks on 'Credit Card Register-Corp' and return:
       [{ 'top_cell': (r,c), 'digits': '0652', 'header_row': int, 'date_col': int, 'amount_col': int, 'cat_col': int }]
-
-    Reads digits from the cell to the RIGHT of the 'Type of Credit Card' label (fallback: same cell).
-    Finds headers in a LOCAL window to avoid mixing blocks.
+    More tolerant of label text (e.g., "Type of Cred") and uses a wider header search window.
     """
+    label_ok = re.compile(r"type\s+of\s+cred", re.I)  # matches "Type of Credit Card", "Type of Cred", etc.
     blocks: List[Dict] = []
+
     for r in range(1, ws.max_row + 1):
         for c in range(1, ws.max_column + 1):
             v = ws.cell(row=r, column=c).value
             if not isinstance(v, str):
                 continue
-            if "type of credit card" not in v.strip().lower():
+            if not label_ok.search(v.strip()):
                 continue
 
             # digits prefer right cell, fallback to same cell
@@ -406,14 +434,14 @@ def scan_cc_blocks(ws) -> List[Dict]:
             if not digits:
                 continue
 
-            # Find headers near this label (local window to the right)
+            # Wider window for headers to the right of the label
             header_row = None
             date_col = amount_col = cat_col = None
-            for rr in range(r + 1, min(r + 25, ws.max_row + 1)):
+            for rr in range(r + 1, min(r + 40, ws.max_row + 1)):  # was +25
                 row_vals = [
                     (str(ws.cell(row=rr, column=cc).value).strip().lower()
                      if ws.cell(row=rr, column=cc).value is not None else "")
-                    for cc in range(c, min(c + 16, ws.max_column + 1))
+                    for cc in range(c, min(c + 40, ws.max_column + 1))  # was +16
                 ]
                 try:
                     d_idx = row_vals.index("date")
@@ -437,7 +465,12 @@ def scan_cc_blocks(ws) -> List[Dict]:
                     "amount_col": amount_col,
                     "cat_col": cat_col,
                 })
+            # Optional: debug if label found but headers not hooked
+            # else:
+            #     print(f"[DEBUG] Found label for {digits} at ({r},{c}) but could not locate headers nearby.")
+
     return blocks
+
 
 
 def write_cc_block(ws, block: Dict, txs: List[Dict], previous_balance: Optional[float] = None):
